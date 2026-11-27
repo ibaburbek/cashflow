@@ -69,3 +69,44 @@ export function saveSoundSetting(enabled: boolean): void {
     // Ignore
   }
 }
+
+const SESSION_ID_KEY = 'qarjy_agyny_session_id_v1';
+const ONLINE_PROFILE_KEY = 'qarjy_agyny_online_profile_v1';
+
+export function getOrCreateSessionId(): string {
+  try {
+    const existing = localStorage.getItem(SESSION_ID_KEY);
+    if (existing && existing.length >= 6) return existing;
+    const created = `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+    localStorage.setItem(SESSION_ID_KEY, created);
+    return created;
+  } catch {
+    return `sess_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+  }
+}
+
+export interface StoredOnlineProfile {
+  name: string;
+  professionId: string;
+  dreamId: string;
+  color: string;
+}
+
+export function saveOnlineProfile(profile: StoredOnlineProfile): void {
+  try {
+    localStorage.setItem(ONLINE_PROFILE_KEY, JSON.stringify(profile));
+  } catch {
+    // Ignore
+  }
+}
+
+export function loadOnlineProfile(): StoredOnlineProfile | null {
+  try {
+    const raw = localStorage.getItem(ONLINE_PROFILE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as StoredOnlineProfile;
+  } catch {
+    return null;
+  }
+}
+

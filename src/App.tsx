@@ -1,14 +1,20 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   BookOpen,
+  Bot,
   History,
   Home,
   Moon,
+  SkipForward,
   Sun,
   Users,
   Volume2,
   VolumeX,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
+import { OFFLINE_TURN_WAIT_SECONDS } from './config/peerConfig';
 import { BIG_DEALS, DREAMS, FAST_TRACK_DEALS, SMALL_DEALS } from './data/assets';
 import { FAST_TRACK_BOARD, RAT_RACE_BOARD } from './data/board';
 import { DOODADS, GENERAL_FINANCIAL_TIPS, MARKET_EVENTS } from './data/events';
@@ -16,22 +22,36 @@ import { buildInitialLiabilities, PROFESSIONS } from './data/professions';
 import {
   ActiveModalState,
   DealCard,
+  GuestAction,
+  LobbyPlayer,
+  OnlineGameSnapshot,
+  OnlineRole,
   OwnedAsset,
   PendingAutoLoan,
+  PeerMessage,
   Player,
   SavedGameState,
   ScreenMode,
   ThemeMode,
+  ToastNotice,
   TurnLogEntry,
 } from './types/game';
 import { calculatePlayerSummary, formatTenge } from './utils/format';
+import {
+  normalizeRoomCode,
+  OnlineGuestTransport,
+  OnlineHostTransport,
+} from './utils/peerManager';
 import { sound } from './utils/sound';
 import {
   clearGameState,
+  getOrCreateSessionId,
   loadGameState,
+  loadOnlineProfile,
   loadSoundSetting,
   loadThemeMode,
   saveGameState,
+  saveOnlineProfile,
   saveSoundSetting,
   saveThemeMode,
 } from './utils/storage';
@@ -41,6 +61,7 @@ import { GameBoard } from './components/GameBoard';
 import { QoshqarMuiizEmblem } from './components/KazakhOrnament';
 import { LoanModal } from './components/LoanModal';
 import { MiniStatement } from './components/MiniStatement';
+import { LOBBY_COLORS, OnlineLobby } from './components/OnlineLobby';
 import { RulesModal } from './components/RulesModal';
 import { PlayerDraft, SetupScreen } from './components/SetupScreen';
 import { VictoryScreen } from './components/VictoryScreen';
@@ -82,7 +103,84 @@ function buildPendingAutoLoan(
   };
 }
 
+function buildModalToast(player: Player, queued: ActiveModalState[]): ToastNotice | null {
+  const first = queued[0];
+  if (!first) return null;
+  switch (first.type) {
+    case 'payday':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} жалақы күнін алуда (${(first.paydayAmount || 0) >= 0 ? '+' : ''}${formatTenge(first.paydayAmount || 0)})`,
+      };
+    case 'opportunity_choice':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} «Мүмкіндік» картасын таңдауда...`,
+      };
+    case 'doodad':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} күтпеген шығынға тап болды`,
+      };
+    case 'market_event':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `Нарық оқиғасы: ${first.marketEvent?.title || ''}`,
+      };
+    case 'charity':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} қайырымдылық шешімін қабылдауда`,
+      };
+    case 'child':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} отбасында бала дүниеге келді!`,
+      };
+    case 'downsized':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} жұмыстан қысқартуға түсті`,
+      };
+    case 'ft_business':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} Еркін жол бизнесін қарауда`,
+      };
+    case 'ft_dream':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name} Арман ұяшығына түсті`,
+      };
+    case 'ft_risk':
+      return {
+        id: makeId('toast'),
+        playerColor: player.color,
+        message: `${player.name}: ${first.riskTitle || 'Тәуекел'}`,
+      };
+    default:
+      return null;
+  }
+}
+
 export default function App() {
+  const mySessionId = useMemo(() => getOrCreateSessionId(), []);
+  const initialRoomCode = useMemo(() => {
+    if (typeof window === 'undefined') return '';
+    return normalizeRoomCode(
+      new URLSearchParams(window.location.search).get('room') || ''
+    );
+  }, []);
+
   const [theme, setTheme] = useState<ThemeMode>(() => loadThemeMode());
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
     const s = loadSoundSetting();
@@ -107,6 +205,23 @@ export default function App() {
   const [winnerId, setWinnerId] = useState<string | null>(null);
   const [winReason, setWinReason] = useState<string | null>(null);
 
+  // Online multiplayer state
+  const [onlineRole, setOnlineRole] = useState<OnlineRole>('local');
+  const [roomCode, setRoomCode] = useState<string>('');
+  const [hostSessionId, setHostSessionId] = useState<string>('');
+  const [lobbyPlayers, setLobbyPlayers] = useState<LobbyPlayer[]>([]);
+  const [onlineBusy, setOnlineBusy] = useState<boolean>(false);
+  const [onlineError, setOnlineError] = useState<string | null>(null);
+  const [hostDisconnected, setHostDisconnected] = useState<boolean>(false);
+  const [toastNotice, setToastNotice] = useState<ToastNotice | null>(null);
+  const [offlineCountdown, setOfflineCountdown] = useState<number | null>(null);
+
+  const hostTransportRef = useRef<OnlineHostTransport | null>(null);
+  const guestTransportRef = useRef<OnlineGuestTransport | null>(null);
+  const prevGuestSnapRef = useRef<{ rolling: boolean; pos: number; screen: string } | null>(
+    null
+  );
+
   const activeModal = modalQueue[0] || null;
   const queueIndicator =
     modalQueue.length > 0 && queueTotalCount > 1
@@ -117,6 +232,17 @@ export default function App() {
   const clearAllTimers = useCallback(() => {
     timersRef.current.forEach((id) => window.clearTimeout(id));
     timersRef.current = [];
+  }, []);
+
+  const cleanupOnlineTransports = useCallback(() => {
+    if (hostTransportRef.current) {
+      hostTransportRef.current.destroy();
+      hostTransportRef.current = null;
+    }
+    if (guestTransportRef.current) {
+      guestTransportRef.current.destroy();
+      guestTransportRef.current = null;
+    }
   }, []);
 
   useEffect(() => {
@@ -130,7 +256,7 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    if (screen === 'playing' || screen === 'victory') {
+    if (onlineRole === 'local' && (screen === 'playing' || screen === 'victory')) {
       const state: SavedGameState = {
         screen,
         players,
@@ -144,11 +270,14 @@ export default function App() {
       saveGameState(state);
       setSavedExists(true);
     }
-  }, [screen, players, currentPlayerIndex, turnCount, logs, winnerId, winReason, lastDice]);
+  }, [onlineRole, screen, players, currentPlayerIndex, turnCount, logs, winnerId, winReason, lastDice]);
 
   useEffect(() => {
-    return () => clearAllTimers();
-  }, [clearAllTimers]);
+    return () => {
+      clearAllTimers();
+      cleanupOnlineTransports();
+    };
+  }, [clearAllTimers, cleanupOnlineTransports]);
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
@@ -178,6 +307,14 @@ export default function App() {
 
   const handleStartNewGame = (drafts: PlayerDraft[]) => {
     clearAllTimers();
+    cleanupOnlineTransports();
+    setOnlineRole('local');
+    setRoomCode('');
+    setLobbyPlayers([]);
+    setHostDisconnected(false);
+    setToastNotice(null);
+    setOfflineCountdown(null);
+
     const initialPlayers: Player[] = drafts.map((d, idx) => {
       const prof = PROFESSIONS.find((p) => p.id === d.professionId) || PROFESSIONS[0];
       const dream = DREAMS.find((dr) => dr.id === d.dreamId) || DREAMS[0];
@@ -238,6 +375,13 @@ export default function App() {
     const saved = loadGameState();
     if (!saved) return;
     clearAllTimers();
+    cleanupOnlineTransports();
+    setOnlineRole('local');
+    setRoomCode('');
+    setLobbyPlayers([]);
+    setHostDisconnected(false);
+    setToastNotice(null);
+    setOfflineCountdown(null);
     setPlayers(saved.players);
     setCurrentPlayerIndex(saved.currentPlayerIndex);
     setTurnCount(saved.turnCount);
@@ -350,6 +494,7 @@ export default function App() {
       setPlayers(working);
       setCurrentPlayerIndex(nextIdx);
       setTurnCount((t) => t + 1);
+      setToastNotice(null);
     },
     [addLog]
   );
@@ -669,6 +814,9 @@ export default function App() {
         if (queued.length > 0) {
           setModalQueue(queued);
           setQueueTotalCount(queued.length);
+          if (onlineRole === 'online_host') {
+            setToastNotice(buildModalToast(landedPlayer, queued));
+          }
         } else if (landedOnPaydaySquare || sq.type === 'child') {
           setPlayers((prev) => {
             const tId = window.setTimeout(() => advanceTurn(prev, idx), 350);
@@ -783,13 +931,16 @@ export default function App() {
         if (queued.length > 0) {
           setModalQueue(queued);
           setQueueTotalCount(queued.length);
+          if (onlineRole === 'online_host') {
+            setToastNotice(buildModalToast(landedPlayer, queued));
+          }
         }
       }
     },
-    [currentPlayerIndex, addLog, checkGraduationToFastTrack, advanceTurn, checkVictory]
+    [currentPlayerIndex, addLog, checkGraduationToFastTrack, advanceTurn, checkVictory, onlineRole]
   );
 
-  const handleRollDice = useCallback(
+  const executeRollDice = useCallback(
     (useTwoDice?: boolean) => {
       const current = players[currentPlayerIndex];
       if (!current || rolling || isStepping || modalQueue.length > 0 || screen !== 'playing') return;
@@ -913,17 +1064,18 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (onlineRole === 'online_guest') return;
     if (screen !== 'playing' || rolling || isStepping || modalQueue.length > 0) return;
     const current = players[currentPlayerIndex];
     if (!current || !current.isBot) return;
 
     const botTimer = window.setTimeout(() => {
-      handleRollDice(current.charityTurnsLeft > 0 || current.phase === 'fast_track');
+      executeRollDice(current.charityTurnsLeft > 0 || current.phase === 'fast_track');
     }, 650);
     timersRef.current.push(botTimer);
 
     return () => window.clearTimeout(botTimer);
-  }, [screen, rolling, isStepping, modalQueue.length, players, currentPlayerIndex, handleRollDice]);
+  }, [onlineRole, screen, rolling, isStepping, modalQueue.length, players, currentPlayerIndex, executeRollDice]);
 
   const popCurrentModal = useCallback(() => {
     const remaining = modalQueue.slice(1);
@@ -939,21 +1091,33 @@ export default function App() {
       sound.playWarning();
       setModalQueue((prev) => [{ type: 'auto_loan_warning', autoLoan }, ...prev.slice(1)]);
       setQueueTotalCount((c) => Math.max(1, c) + 1);
+      if (onlineRole === 'online_host') {
+        const cur = players[currentPlayerIndex];
+        if (cur) {
+          setToastNotice({
+            id: makeId('toast'),
+            playerColor: cur.color,
+            message: `${cur.name} банк несиесін растауда...`,
+          });
+        }
+      }
     },
-    []
+    [onlineRole, players, currentPlayerIndex]
   );
 
-  const handleChooseDealSize = (size: 'small' | 'big') => {
+  const executeChooseDealSize = (size: 'small' | 'big') => {
+    if (activeModal?.type !== 'opportunity_choice') return;
     const deal: DealCard =
       size === 'small' ? randomItem(SMALL_DEALS) : randomItem(BIG_DEALS);
     setModalQueue((prev) => [{ type: 'deal_card', deal }, ...prev.slice(1)]);
   };
 
-  const handleBuyDeal = (quantity: number, useLoanIfNeeded: boolean) => {
+  const executeBuyDeal = (quantity: number, useLoanIfNeeded: boolean) => {
     const current = players[currentPlayerIndex];
-    if (!activeModal?.deal || !current) return;
+    if (activeModal?.type !== 'deal_card' || !activeModal.deal || !current) return;
     const deal = activeModal.deal;
-    const totalCost = deal.isTradable ? deal.cost * quantity : deal.cost;
+    const safeQty = Math.max(1, Math.floor(quantity) || 1);
+    const totalCost = deal.isTradable ? deal.cost * safeQty : deal.cost;
 
     if (current.cash < totalCost) {
       if (!useLoanIfNeeded) return;
@@ -962,7 +1126,7 @@ export default function App() {
         current,
         shortfall,
         `Мәміле: ${deal.title}`,
-        { type: 'deal', dealId: deal.id, quantity, totalCost }
+        { type: 'deal', dealId: deal.id, quantity: safeQty, totalCost }
       );
       pushAutoLoanModal(autoLoan);
       return;
@@ -976,7 +1140,7 @@ export default function App() {
           dealId: deal.id,
           title: deal.title,
           category: deal.category,
-          quantity: deal.isTradable ? quantity : 1,
+          quantity: deal.isTradable ? safeQty : 1,
           unitCost: deal.cost,
           downPaymentPaid: totalCost,
           mortgage: deal.mortgage || 0,
@@ -1008,7 +1172,14 @@ export default function App() {
     );
   };
 
-  const handleSkipDeal = () => {
+  const executeSkipDeal = () => {
+    if (
+      activeModal?.type !== 'deal_card' &&
+      activeModal?.type !== 'ft_business' &&
+      activeModal?.type !== 'ft_dream'
+    ) {
+      return;
+    }
     const current = players[currentPlayerIndex];
     if (current) {
       addLog(current, 'Мәмілені өткізіп жіберді.');
@@ -1019,9 +1190,9 @@ export default function App() {
     }
   };
 
-  const handleApplyMarketEvent = (sellAssetInstanceIds: string[]) => {
-    const ev = activeModal?.marketEvent;
-    if (!ev) return;
+  const executeApplyMarketEvent = (sellAssetInstanceIds: string[]) => {
+    if (activeModal?.type !== 'market_event' || !activeModal.marketEvent) return;
+    const ev = activeModal.marketEvent;
     const remaining = popCurrentModal();
 
     const idx = currentPlayerIndex;
@@ -1091,10 +1262,11 @@ export default function App() {
     }
   };
 
-  const handlePayDoodad = (useKaspiRed: boolean) => {
-    const dd = activeModal?.doodad;
+  const executePayDoodad = (useKaspiRed: boolean) => {
+    if (activeModal?.type !== 'doodad' || !activeModal.doodad) return;
+    const dd = activeModal.doodad;
     const current = players[currentPlayerIndex];
-    if (!dd || !current) return;
+    if (!current) return;
 
     if (!useKaspiRed && current.cash < dd.cost) {
       const shortfall = dd.cost - current.cash;
@@ -1156,7 +1328,8 @@ export default function App() {
     );
   };
 
-  const handleCharityDecision = (accept: boolean) => {
+  const executeCharityDecision = (accept: boolean) => {
+    if (activeModal?.type !== 'charity') return;
     const current = players[currentPlayerIndex];
     if (!current) return;
     const summary = calculatePlayerSummary(current);
@@ -1182,7 +1355,8 @@ export default function App() {
     );
   };
 
-  const handleAcknowledgeChild = () => {
+  const executeAcknowledgeChild = () => {
+    if (activeModal?.type !== 'child') return;
     const remaining = popCurrentModal();
     commitPlayerUpdate(
       (p) => {
@@ -1193,7 +1367,8 @@ export default function App() {
     );
   };
 
-  const handleAcknowledgeDownsized = () => {
+  const executeAcknowledgeDownsized = () => {
+    if (activeModal?.type !== 'downsized') return;
     const current = players[currentPlayerIndex];
     if (!current) return;
     const s = calculatePlayerSummary(current);
@@ -1223,8 +1398,9 @@ export default function App() {
     );
   };
 
-  const handleAcknowledgePayday = () => {
-    const amt = activeModal?.paydayAmount || 0;
+  const executeAcknowledgePayday = () => {
+    if (activeModal?.type !== 'payday') return;
+    const amt = activeModal.paydayAmount || 0;
     const current = players[currentPlayerIndex];
     if (current) {
       addLog(
@@ -1238,16 +1414,17 @@ export default function App() {
     }
   };
 
-  const handleAcknowledgePhaseTransition = () => {
+  const executeAcknowledgePhaseTransition = () => {
+    if (activeModal?.type !== 'phase_transition') return;
     const remaining = popCurrentModal();
     if (remaining.length === 0) {
       advanceTurn(players, currentPlayerIndex);
     }
   };
 
-  const handleBuyFastTrackBusiness = () => {
-    const deal = activeModal?.ftDeal;
-    if (!deal) return;
+  const executeBuyFastTrackBusiness = () => {
+    if (activeModal?.type !== 'ft_business' || !activeModal.ftDeal) return;
+    const deal = activeModal.ftDeal;
     const remaining = popCurrentModal();
     commitPlayerUpdate(
       (p) => {
@@ -1268,9 +1445,9 @@ export default function App() {
     );
   };
 
-  const handleBuyDream = () => {
-    const dream = activeModal?.dream;
-    if (!dream) return;
+  const executeBuyDream = () => {
+    if (activeModal?.type !== 'ft_dream' || !activeModal.dream) return;
+    const dream = activeModal.dream;
     const remaining = popCurrentModal();
     commitPlayerUpdate(
       (p) => {
@@ -1286,9 +1463,10 @@ export default function App() {
     );
   };
 
-  const handleAcknowledgeFastTrackRisk = () => {
-    const amt = activeModal?.riskAmount || 0;
-    const title = activeModal?.riskTitle || 'Шығын';
+  const executeAcknowledgeFastTrackRisk = () => {
+    if (activeModal?.type !== 'ft_risk') return;
+    const amt = activeModal.riskAmount || 0;
+    const title = activeModal.riskTitle || 'Шығын';
     const remaining = popCurrentModal();
     commitPlayerUpdate(
       (p) => {
@@ -1299,9 +1477,9 @@ export default function App() {
     );
   };
 
-  const handleConfirmAutoLoan = () => {
-    const autoLoan = activeModal?.autoLoan;
-    if (!autoLoan) return;
+  const executeConfirmAutoLoan = () => {
+    if (activeModal?.type !== 'auto_loan_warning' || !activeModal.autoLoan) return;
+    const autoLoan = activeModal.autoLoan;
     const remaining = popCurrentModal();
 
     commitPlayerUpdate(
@@ -1419,7 +1597,8 @@ export default function App() {
     );
   };
 
-  const handleTakeManualLoan = (amount: number) => {
+  const executeTakeManualLoan = (amount: number) => {
+    if (amount <= 0) return;
     commitPlayerUpdate((p) => {
       sound.playPayday();
       addLog(p, `Банктен ${formatTenge(amount)} несие алды.`);
@@ -1432,7 +1611,8 @@ export default function App() {
     });
   };
 
-  const handleRepayBankLoan = (amount: number) => {
+  const executeRepayBankLoan = (amount: number) => {
+    if (amount <= 0) return;
     commitPlayerUpdate(
       (p) => {
         const pay = Math.min(amount, p.bankLoan, p.cash);
@@ -1449,7 +1629,7 @@ export default function App() {
     );
   };
 
-  const handlePayLiability = (liabilityId: string) => {
+  const executePayLiability = (liabilityId: string) => {
     commitPlayerUpdate(
       (p) => {
         const target = p.liabilities.find((l) => l.id === liabilityId);
@@ -1466,10 +1646,728 @@ export default function App() {
     );
   };
 
-  const handlePlayAgain = () => {
+  // UI Action Dispatchers (either run locally/host or forward to host from guest)
+  const isMyOnlineTurn =
+    onlineRole === 'local' ||
+    (players[currentPlayerIndex]?.sessionId === mySessionId &&
+      !players[currentPlayerIndex]?.isBot);
+
+  const dispatchAction = useCallback(
+    (action: GuestAction, localExecutor: () => void) => {
+      if (onlineRole === 'online_guest') {
+        if (!isMyOnlineTurn) return;
+        guestTransportRef.current?.sendAction(mySessionId, action);
+        return;
+      }
+      if (onlineRole === 'online_host' && !isMyOnlineTurn) return;
+      localExecutor();
+    },
+    [onlineRole, isMyOnlineTurn, mySessionId]
+  );
+
+  const handleRollDice = useCallback(
+    (useTwoDice?: boolean) => {
+      dispatchAction({ type: 'ROLL_DICE', useTwoDice }, () => executeRollDice(useTwoDice));
+    },
+    [dispatchAction, executeRollDice]
+  );
+
+  const handleChooseDealSize = (size: 'small' | 'big') => {
+    dispatchAction({ type: 'CHOOSE_DEAL_SIZE', size }, () => executeChooseDealSize(size));
+  };
+
+  const handleBuyDeal = (quantity: number, useLoanIfNeeded: boolean) => {
+    dispatchAction({ type: 'BUY_DEAL', quantity, useLoanIfNeeded }, () =>
+      executeBuyDeal(quantity, useLoanIfNeeded)
+    );
+  };
+
+  const handleSkipDeal = () => {
+    dispatchAction({ type: 'SKIP_DEAL' }, () => executeSkipDeal());
+  };
+
+  const handleApplyMarketEvent = (sellAssetInstanceIds: string[]) => {
+    dispatchAction({ type: 'APPLY_MARKET_EVENT', sellAssetInstanceIds }, () =>
+      executeApplyMarketEvent(sellAssetInstanceIds)
+    );
+  };
+
+  const handlePayDoodad = (useKaspiRed: boolean) => {
+    dispatchAction({ type: 'PAY_DOODAD', useKaspiRed }, () =>
+      executePayDoodad(useKaspiRed)
+    );
+  };
+
+  const handleCharityDecision = (accept: boolean) => {
+    dispatchAction({ type: 'CHARITY_DECISION', accept }, () =>
+      executeCharityDecision(accept)
+    );
+  };
+
+  const handleAcknowledgeChild = () => {
+    dispatchAction({ type: 'ACK_CHILD' }, () => executeAcknowledgeChild());
+  };
+
+  const handleAcknowledgeDownsized = () => {
+    dispatchAction({ type: 'ACK_DOWNSIZED' }, () => executeAcknowledgeDownsized());
+  };
+
+  const handleAcknowledgePayday = () => {
+    dispatchAction({ type: 'ACK_PAYDAY' }, () => executeAcknowledgePayday());
+  };
+
+  const handleAcknowledgePhaseTransition = () => {
+    dispatchAction({ type: 'ACK_PHASE_TRANSITION' }, () =>
+      executeAcknowledgePhaseTransition()
+    );
+  };
+
+  const handleBuyFastTrackBusiness = () => {
+    dispatchAction({ type: 'BUY_FT_BUSINESS' }, () => executeBuyFastTrackBusiness());
+  };
+
+  const handleBuyDream = () => {
+    dispatchAction({ type: 'BUY_DREAM' }, () => executeBuyDream());
+  };
+
+  const handleAcknowledgeFastTrackRisk = () => {
+    dispatchAction({ type: 'ACK_FT_RISK' }, () => executeAcknowledgeFastTrackRisk());
+  };
+
+  const handleConfirmAutoLoan = () => {
+    dispatchAction({ type: 'CONFIRM_AUTO_LOAN' }, () => executeConfirmAutoLoan());
+  };
+
+  const handleTakeManualLoan = (amount: number) => {
+    dispatchAction({ type: 'TAKE_MANUAL_LOAN', amount }, () =>
+      executeTakeManualLoan(amount)
+    );
+  };
+
+  const handleRepayBankLoan = (amount: number) => {
+    dispatchAction({ type: 'REPAY_BANK_LOAN', amount }, () =>
+      executeRepayBankLoan(amount)
+    );
+  };
+
+  const handlePayLiability = (liabilityId: string) => {
+    dispatchAction({ type: 'PAY_LIABILITY', liabilityId }, () =>
+      executePayLiability(liabilityId)
+    );
+  };
+
+  // Online Host: build and broadcast latest authoritative snapshot
+  const latestSnapshot = useMemo<OnlineGameSnapshot>(
+    () => ({
+      screen: screen === 'menu' ? 'lobby' : screen,
+      roomCode,
+      hostSessionId,
+      lobbyPlayers,
+      players,
+      currentPlayerIndex,
+      turnCount,
+      logs: logs.slice(0, 40),
+      lastDice,
+      rolling,
+      isStepping,
+      modalQueue,
+      queueTotalCount,
+      winnerId,
+      winReason,
+      toast: toastNotice,
+    }),
+    [
+      screen,
+      roomCode,
+      hostSessionId,
+      lobbyPlayers,
+      players,
+      currentPlayerIndex,
+      turnCount,
+      logs,
+      lastDice,
+      rolling,
+      isStepping,
+      modalQueue,
+      queueTotalCount,
+      winnerId,
+      winReason,
+      toastNotice,
+    ]
+  );
+
+  const latestSnapshotRef = useRef<OnlineGameSnapshot>(latestSnapshot);
+  latestSnapshotRef.current = latestSnapshot;
+
+  useEffect(() => {
+    if (onlineRole === 'online_host' && screen !== 'menu') {
+      hostTransportRef.current?.broadcastSnapshot(latestSnapshot);
+    }
+  }, [onlineRole, screen, latestSnapshot]);
+
+  // Host refs to avoid stale closures inside PeerJS event callbacks
+  const hostCallbacksRef = useRef<{
+    onHello: (
+      msg: Extract<PeerMessage, { type: 'HELLO' }>
+    ) => { accepted: boolean; errorReason?: string };
+    onAction: (sessionId: string, action: GuestAction) => void;
+    onDisconnect: (sessionId: string) => void;
+  }>({
+    onHello: () => ({ accepted: false }),
+    onAction: () => {},
+    onDisconnect: () => {},
+  });
+
+  hostCallbacksRef.current = {
+    onHello: (msg) => {
+      if (screen === 'lobby') {
+        const existingIdx = lobbyPlayers.findIndex((p) => p.sessionId === msg.sessionId);
+        if (existingIdx >= 0) {
+          setLobbyPlayers((prev) =>
+            prev.map((p, i) =>
+              i === existingIdx ? { ...p, isConnected: true } : p
+            )
+          );
+          window.setTimeout(() => {
+            hostTransportRef.current?.sendToSession(msg.sessionId, {
+              type: 'STATE_SYNC',
+              snapshot: latestSnapshotRef.current,
+            });
+          }, 40);
+          return { accepted: true };
+        }
+
+        if (lobbyPlayers.length >= 6) {
+          return { accepted: false, errorReason: 'Бөлме толы (ең көбі 6 ойыншы).' };
+        }
+
+        const usedColors = new Set(lobbyPlayers.map((p) => p.color));
+        const pickedColor =
+          msg.preferredColor && !usedColors.has(msg.preferredColor)
+            ? msg.preferredColor
+            : LOBBY_COLORS.find((c) => !usedColors.has(c.hex))?.hex ||
+              PLAYER_COLORS[lobbyPlayers.length % PLAYER_COLORS.length];
+
+        const colorIdx = Math.max(
+          0,
+          LOBBY_COLORS.findIndex((c) => c.hex === pickedColor)
+        );
+        const newLobbyPlayer: LobbyPlayer = {
+          sessionId: msg.sessionId,
+          name: msg.name.trim() || `Ойыншы ${lobbyPlayers.length + 1}`,
+          professionId:
+            PROFESSIONS.find((p) => p.id === msg.professionId)?.id ||
+            PROFESSIONS[lobbyPlayers.length % PROFESSIONS.length].id,
+          dreamId:
+            DREAMS.find((d) => d.id === msg.dreamId)?.id ||
+            DREAMS[lobbyPlayers.length % DREAMS.length].id,
+          color: pickedColor,
+          tokenSymbol: PLAYER_SYMBOLS[colorIdx % PLAYER_SYMBOLS.length],
+          isHost: false,
+          isReady: false,
+          isConnected: true,
+        };
+
+        setLobbyPlayers((prev) => [...prev, newLobbyPlayer]);
+        return { accepted: true };
+      }
+
+      // Game already started: allow reconnect only if sessionId matches a seat
+      const seatIdx = players.findIndex((p) => p.sessionId === msg.sessionId);
+      if (seatIdx < 0) {
+        return {
+          accepted: false,
+          errorReason: 'Ойын басталып кеткен. Жаңа ойыншы қосыла алмайды.',
+        };
+      }
+
+      const returningPlayer = players[seatIdx];
+      setPlayers((prev) =>
+        prev.map((p, i) =>
+          i === seatIdx
+            ? { ...p, isConnected: true, isBot: false, botControlled: false }
+            : p
+        )
+      );
+      addLog(returningPlayer, 'Ойынға қайта қосылды!');
+      window.setTimeout(() => {
+        hostTransportRef.current?.sendToSession(msg.sessionId, {
+          type: 'STATE_SYNC',
+          snapshot: latestSnapshotRef.current,
+        });
+      }, 40);
+      return { accepted: true };
+    },
+
+    onAction: (sessionId, action) => {
+      if (screen === 'lobby') {
+        if (action.type === 'LOBBY_UPDATE_PROFILE') {
+          setLobbyPlayers((prev) => {
+            const colorTaken = prev.some(
+              (p) => p.sessionId !== sessionId && p.color === action.color
+            );
+            return prev.map((p) => {
+              if (p.sessionId !== sessionId) return p;
+              const nextColor = colorTaken ? p.color : action.color;
+              const symIdx = Math.max(
+                0,
+                LOBBY_COLORS.findIndex((c) => c.hex === nextColor)
+              );
+              return {
+                ...p,
+                name: action.name.slice(0, 24),
+                professionId: action.professionId,
+                dreamId: action.dreamId,
+                color: nextColor,
+                tokenSymbol: PLAYER_SYMBOLS[symIdx % PLAYER_SYMBOLS.length],
+              };
+            });
+          });
+        } else if (action.type === 'LOBBY_TOGGLE_READY') {
+          setLobbyPlayers((prev) =>
+            prev.map((p) =>
+              p.sessionId === sessionId ? { ...p, isReady: action.isReady } : p
+            )
+          );
+        }
+        return;
+      }
+
+      if (screen !== 'playing') return;
+      const current = players[currentPlayerIndex];
+      if (!current || current.sessionId !== sessionId || current.isBot) return;
+
+      switch (action.type) {
+        case 'ROLL_DICE':
+          executeRollDice(action.useTwoDice);
+          break;
+        case 'CHOOSE_DEAL_SIZE':
+          executeChooseDealSize(action.size);
+          break;
+        case 'BUY_DEAL':
+          executeBuyDeal(action.quantity, action.useLoanIfNeeded);
+          break;
+        case 'SKIP_DEAL':
+          executeSkipDeal();
+          break;
+        case 'APPLY_MARKET_EVENT':
+          executeApplyMarketEvent(action.sellAssetInstanceIds);
+          break;
+        case 'PAY_DOODAD':
+          executePayDoodad(action.useKaspiRed);
+          break;
+        case 'CHARITY_DECISION':
+          executeCharityDecision(action.accept);
+          break;
+        case 'ACK_CHILD':
+          executeAcknowledgeChild();
+          break;
+        case 'ACK_DOWNSIZED':
+          executeAcknowledgeDownsized();
+          break;
+        case 'ACK_PAYDAY':
+          executeAcknowledgePayday();
+          break;
+        case 'ACK_PHASE_TRANSITION':
+          executeAcknowledgePhaseTransition();
+          break;
+        case 'BUY_FT_BUSINESS':
+          executeBuyFastTrackBusiness();
+          break;
+        case 'BUY_DREAM':
+          executeBuyDream();
+          break;
+        case 'ACK_FT_RISK':
+          executeAcknowledgeFastTrackRisk();
+          break;
+        case 'CONFIRM_AUTO_LOAN':
+          executeConfirmAutoLoan();
+          break;
+        case 'TAKE_MANUAL_LOAN':
+          executeTakeManualLoan(action.amount);
+          break;
+        case 'REPAY_BANK_LOAN':
+          executeRepayBankLoan(action.amount);
+          break;
+        case 'PAY_LIABILITY':
+          executePayLiability(action.liabilityId);
+          break;
+      }
+    },
+
+    onDisconnect: (sessionId) => {
+      if (screen === 'lobby') {
+        setLobbyPlayers((prev) =>
+          prev.map((p) =>
+            p.sessionId === sessionId ? { ...p, isConnected: false, isReady: false } : p
+          )
+        );
+        return;
+      }
+
+      const disconnectedPlayer = players.find((p) => p.sessionId === sessionId);
+      setPlayers((prev) =>
+        prev.map((p) =>
+          p.sessionId === sessionId ? { ...p, isConnected: false } : p
+        )
+      );
+      if (disconnectedPlayer) {
+        addLog(disconnectedPlayer, 'Байланыстан ажыратылды (офлайн).');
+      }
+    },
+  };
+
+  // Host 30s disconnect countdown when current active player is offline
+  useEffect(() => {
+    if (onlineRole !== 'online_host' || screen !== 'playing') {
+      setOfflineCountdown(null);
+      return;
+    }
+
+    const current = players[currentPlayerIndex];
+    const isOfflineTurn = Boolean(
+      current &&
+        current.sessionId !== mySessionId &&
+        !current.isBot &&
+        current.isConnected === false
+    );
+
+    if (!isOfflineTurn) {
+      setOfflineCountdown(null);
+      return;
+    }
+
+    setOfflineCountdown(OFFLINE_TURN_WAIT_SECONDS);
+    const intervalId = window.setInterval(() => {
+      setOfflineCountdown((prev) => {
+        if (prev === null || prev <= 1) {
+          window.clearInterval(intervalId);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(intervalId);
+  }, [onlineRole, screen, players, currentPlayerIndex, mySessionId]);
+
+  const handleCreateOnlineRoom = (rawName: string) => {
+    const cleanName = rawName.trim() || 'Хост';
+    const savedProf = loadOnlineProfile();
+    const profId = savedProf?.professionId || PROFESSIONS[0].id;
+    const dreamId = savedProf?.dreamId || DREAMS[0].id;
+    const color = savedProf?.color || LOBBY_COLORS[0].hex;
+    saveOnlineProfile({ name: cleanName, professionId: profId, dreamId, color });
+
     clearAllTimers();
-    clearGameState();
-    setSavedExists(false);
+    cleanupOnlineTransports();
+    setOnlineBusy(true);
+    setOnlineError(null);
+    setHostDisconnected(false);
+
+    const hostPlayer: LobbyPlayer = {
+      sessionId: mySessionId,
+      name: cleanName,
+      professionId: profId,
+      dreamId,
+      color,
+      tokenSymbol: PLAYER_SYMBOLS[0],
+      isHost: true,
+      isReady: false,
+      isConnected: true,
+    };
+
+    const transport = new OnlineHostTransport({
+      onReady: (code) => {
+        setOnlineBusy(false);
+        setOnlineRole('online_host');
+        setRoomCode(code);
+        setHostSessionId(mySessionId);
+        setLobbyPlayers([hostPlayer]);
+        setScreen('lobby');
+      },
+      onError: (msg) => {
+        setOnlineBusy(false);
+        setOnlineError(msg);
+        cleanupOnlineTransports();
+      },
+      onGuestHello: (payload) => hostCallbacksRef.current.onHello(payload),
+      onGuestAction: (sessionId, action) =>
+        hostCallbacksRef.current.onAction(sessionId, action),
+      onGuestDisconnect: (sessionId) =>
+        hostCallbacksRef.current.onDisconnect(sessionId),
+    });
+
+    hostTransportRef.current = transport;
+    transport.start();
+  };
+
+  const handleJoinOnlineRoom = (rawCode: string, rawName: string) => {
+    const code = normalizeRoomCode(rawCode);
+    if (code.length !== 5) {
+      setOnlineError('Бөлме коды 5 таңбадан тұруы тиіс.');
+      return;
+    }
+
+    const cleanName = rawName.trim() || 'Ойыншы';
+    const savedProf = loadOnlineProfile();
+    const profId = savedProf?.professionId || PROFESSIONS[1].id;
+    const dreamId = savedProf?.dreamId || DREAMS[1].id;
+    const preferredColor = savedProf?.color;
+    saveOnlineProfile({
+      name: cleanName,
+      professionId: profId,
+      dreamId,
+      color: preferredColor || LOBBY_COLORS[1].hex,
+    });
+
+    clearAllTimers();
+    cleanupOnlineTransports();
+    prevGuestSnapRef.current = null;
+    setOnlineBusy(true);
+    setOnlineError(null);
+    setHostDisconnected(false);
+
+    const transport = new OnlineGuestTransport({
+      onConnected: () => {
+        setOnlineBusy(false);
+        setOnlineRole('online_guest');
+        setRoomCode(code);
+      },
+      onSnapshot: (snap) => {
+        const prev = prevGuestSnapRef.current;
+        if (prev) {
+          if (!prev.rolling && snap.rolling) {
+            sound.playDice();
+          }
+          const curPos = snap.players[snap.currentPlayerIndex]?.position ?? 0;
+          if (snap.isStepping && curPos !== prev.pos) {
+            sound.playStep();
+          }
+          if (prev.screen !== 'victory' && snap.screen === 'victory') {
+            sound.playVictory();
+          }
+        }
+        prevGuestSnapRef.current = {
+          rolling: snap.rolling,
+          pos: snap.players[snap.currentPlayerIndex]?.position ?? 0,
+          screen: snap.screen,
+        };
+
+        setRoomCode(snap.roomCode);
+        setHostSessionId(snap.hostSessionId);
+        setLobbyPlayers(snap.lobbyPlayers);
+        setPlayers(snap.players);
+        setCurrentPlayerIndex(snap.currentPlayerIndex);
+        setTurnCount(snap.turnCount);
+        setLogs(snap.logs);
+        setLastDice(snap.lastDice);
+        setRolling(snap.rolling);
+        setIsStepping(snap.isStepping);
+        setModalQueue(snap.modalQueue);
+        setQueueTotalCount(snap.queueTotalCount);
+        setWinnerId(snap.winnerId);
+        setWinReason(snap.winReason);
+        setToastNotice(snap.toast);
+        setScreen(snap.screen);
+      },
+      onError: (reason) => {
+        setOnlineBusy(false);
+        setOnlineError(reason);
+        setOnlineRole('local');
+        setScreen('menu');
+        cleanupOnlineTransports();
+      },
+      onKicked: (reason) => {
+        setOnlineBusy(false);
+        setOnlineError(reason);
+        setOnlineRole('local');
+        setScreen('menu');
+        cleanupOnlineTransports();
+      },
+      onHostDisconnected: () => {
+        setHostDisconnected(true);
+      },
+    });
+
+    guestTransportRef.current = transport;
+    transport.connect(code, {
+      sessionId: mySessionId,
+      name: cleanName,
+      professionId: profId,
+      dreamId,
+      preferredColor,
+    });
+  };
+
+  const handleLobbyUpdateProfile = (patch: {
+    name: string;
+    professionId: string;
+    dreamId: string;
+    color: string;
+  }) => {
+    saveOnlineProfile(patch);
+    if (onlineRole === 'online_guest') {
+      guestTransportRef.current?.sendAction(mySessionId, {
+        type: 'LOBBY_UPDATE_PROFILE',
+        ...patch,
+      });
+      return;
+    }
+
+    setLobbyPlayers((prev) => {
+      const colorTaken = prev.some(
+        (p) => p.sessionId !== mySessionId && p.color === patch.color
+      );
+      return prev.map((p) => {
+        if (p.sessionId !== mySessionId) return p;
+        const nextColor = colorTaken ? p.color : patch.color;
+        const symIdx = Math.max(
+          0,
+          LOBBY_COLORS.findIndex((c) => c.hex === nextColor)
+        );
+        return {
+          ...p,
+          name: patch.name.slice(0, 24),
+          professionId: patch.professionId,
+          dreamId: patch.dreamId,
+          color: nextColor,
+          tokenSymbol: PLAYER_SYMBOLS[symIdx % PLAYER_SYMBOLS.length],
+        };
+      });
+    });
+  };
+
+  const handleLobbyToggleReady = (nextReady: boolean) => {
+    if (onlineRole === 'online_guest') {
+      guestTransportRef.current?.sendAction(mySessionId, {
+        type: 'LOBBY_TOGGLE_READY',
+        isReady: nextReady,
+      });
+      return;
+    }
+    setLobbyPlayers((prev) =>
+      prev.map((p) =>
+        p.sessionId === mySessionId ? { ...p, isReady: nextReady } : p
+      )
+    );
+  };
+
+  const handleLobbyKickPlayer = (targetSessionId: string) => {
+    if (onlineRole !== 'online_host' || targetSessionId === mySessionId) return;
+    hostTransportRef.current?.kickSession(targetSessionId);
+    setLobbyPlayers((prev) => prev.filter((p) => p.sessionId !== targetSessionId));
+  };
+
+  const handleStartOnlineGame = () => {
+    if (onlineRole !== 'online_host') return;
+    const readyCount = lobbyPlayers.filter((p) => p.isReady && p.isConnected).length;
+    if (lobbyPlayers.length < 2 || readyCount < 2) return;
+
+    const initialPlayers: Player[] = lobbyPlayers.map((lp, idx) => {
+      const prof = PROFESSIONS.find((p) => p.id === lp.professionId) || PROFESSIONS[0];
+      const dream = DREAMS.find((d) => d.id === lp.dreamId) || DREAMS[0];
+      return {
+        id: makeId(`op${idx}`),
+        name: lp.name.trim() || `Ойыншы ${idx + 1}`,
+        isBot: false,
+        botControlled: false,
+        sessionId: lp.sessionId,
+        isConnected: lp.isConnected,
+        color: lp.color,
+        tokenSymbol: lp.tokenSymbol,
+        profession: prof,
+        dream,
+        phase: 'rat_race',
+        position: 0,
+        cash: prof.startingSavings,
+        childrenCount: 0,
+        bankLoan: 0,
+        liabilities: buildInitialLiabilities(prof),
+        assets: [],
+        charityTurnsLeft: 0,
+        missedTurns: 0,
+        fastTrackBasePassive: 0,
+        fastTrackAddedPassive: 0,
+        fastTrackTargetPassive: 5_000_000,
+        boughtDream: false,
+        stats: {
+          turnsPlayed: 0,
+          dealsBought: 0,
+          doodadsPaid: 0,
+          loansTaken: 0,
+          charityGiven: 0,
+        },
+      };
+    });
+
+    setPlayers(initialPlayers);
+    setCurrentPlayerIndex(0);
+    setTurnCount(1);
+    setLogs([
+      {
+        id: makeId('log'),
+        playerName: initialPlayers[0].name,
+        playerColor: initialPlayers[0].color,
+        message: 'Онлайн ойын басталды! Сәттілік тілейміз!',
+        timestamp: Date.now(),
+      },
+    ]);
+    setLastDice([1]);
+    setModalQueue([]);
+    setQueueTotalCount(0);
+    setWinnerId(null);
+    setWinReason(null);
+    setRolling(false);
+    setIsStepping(false);
+    setToastNotice(null);
+    setScreen('playing');
+  };
+
+  const handleHostSkipOfflineTurn = () => {
+    if (onlineRole !== 'online_host') return;
+    const current = players[currentPlayerIndex];
+    if (!current) return;
+    setModalQueue([]);
+    setQueueTotalCount(0);
+    setToastNotice(null);
+    addLog(current, 'Офлайн болғандықтан жүрісі өткізілді.');
+    advanceTurn(players, currentPlayerIndex);
+  };
+
+  const handleHostLetBotPlay = () => {
+    if (onlineRole !== 'online_host') return;
+    const current = players[currentPlayerIndex];
+    if (!current) return;
+
+    const hadOpenModals = modalQueue.length > 0;
+    setModalQueue([]);
+    setQueueTotalCount(0);
+    setToastNotice(null);
+
+    const nextArr = players.map((p, i) =>
+      i === currentPlayerIndex ? { ...p, isBot: true, botControlled: true } : p
+    );
+    setPlayers(nextArr);
+    addLog(current, 'Офлайн — уақытша бот ойнайды.');
+
+    if (hadOpenModals) {
+      const tId = window.setTimeout(() => {
+        advanceTurn(nextArr, currentPlayerIndex);
+      }, 350);
+      timersRef.current.push(tId);
+    }
+  };
+
+  const handleLeaveToMenu = () => {
+    clearAllTimers();
+    cleanupOnlineTransports();
+    setOnlineRole('local');
+    setRoomCode('');
+    setLobbyPlayers([]);
+    setHostDisconnected(false);
+    setToastNotice(null);
+    setOfflineCountdown(null);
     setModalQueue([]);
     setQueueTotalCount(0);
     setShowLoanModal(false);
@@ -1477,8 +2375,33 @@ export default function App() {
     setScreen('menu');
   };
 
+  const handlePlayAgain = () => {
+    clearAllTimers();
+    if (onlineRole === 'local') {
+      clearGameState();
+      setSavedExists(false);
+    }
+    handleLeaveToMenu();
+  };
+
   const currentPlayer = players[currentPlayerIndex];
+  const viewedPlayer =
+    onlineRole === 'local'
+      ? currentPlayer
+      : players.find((p) => p.sessionId === mySessionId) || currentPlayer;
   const winner = players.find((p) => p.id === winnerId) || players[0];
+
+  const canShowPrivateModal =
+    Boolean(activeModal && currentPlayer) &&
+    (onlineRole === 'local' ||
+      (currentPlayer.sessionId === mySessionId && !currentPlayer.isBot));
+
+  const waitingOnlineText =
+    onlineRole !== 'local' && currentPlayer && !isMyOnlineTurn && !currentPlayer.isBot
+      ? modalQueue.length > 0
+        ? `${currentPlayer.name} шешім қабылдап жатыр...`
+        : `${currentPlayer.name} жүріс жасап жатыр...`
+      : null;
 
   return (
     <div className="min-h-screen bg-[#F7F6F2] text-slate-900 dark:bg-[#0B1117] dark:text-slate-100 transition-colors">
@@ -1487,11 +2410,31 @@ export default function App() {
           hasSavedGame={savedExists}
           theme={theme}
           soundEnabled={soundEnabled}
+          initialRoomCode={initialRoomCode}
+          onlineBusy={onlineBusy}
+          onlineError={onlineError}
           onToggleTheme={toggleTheme}
           onToggleSound={toggleSound}
           onResumeSavedGame={handleResumeSavedGame}
           onOpenRules={() => setShowRulesModal(true)}
           onStartNewGame={handleStartNewGame}
+          onCreateOnlineRoom={handleCreateOnlineRoom}
+          onJoinOnlineRoom={handleJoinOnlineRoom}
+        />
+      )}
+
+      {screen === 'lobby' && (
+        <OnlineLobby
+          roomCode={roomCode}
+          isHost={onlineRole === 'online_host'}
+          mySessionId={mySessionId}
+          lobbyPlayers={lobbyPlayers}
+          theme={theme}
+          onUpdateProfile={handleLobbyUpdateProfile}
+          onToggleReady={handleLobbyToggleReady}
+          onKickPlayer={handleLobbyKickPlayer}
+          onStartOnlineGame={handleStartOnlineGame}
+          onLeaveLobby={handleLeaveToMenu}
         />
       )}
 
@@ -1504,7 +2447,7 @@ export default function App() {
         />
       )}
 
-      {screen === 'playing' && currentPlayer && (
+      {screen === 'playing' && currentPlayer && viewedPlayer && (
         <div className="min-h-screen flex flex-col">
           {/* Clean 3-zone Game Header */}
           <header className="sticky top-0 z-30 border-b border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-[#131C26]/90 backdrop-blur-xs">
@@ -1514,6 +2457,11 @@ export default function App() {
                 <span className="text-base sm:text-lg font-extrabold tracking-tight">
                   Қаржы Ағыны
                 </span>
+                {onlineRole !== 'local' && roomCode && (
+                  <span className="hidden sm:inline-flex items-center px-2 py-0.5 rounded-md text-[11px] font-bold font-mono-num bg-teal-50 dark:bg-teal-950/60 text-teal-800 dark:text-teal-300 border border-teal-200 dark:border-teal-800">
+                    {roomCode}
+                  </span>
+                )}
               </div>
 
               <nav className="flex items-center gap-4 sm:gap-6 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-300">
@@ -1527,7 +2475,7 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setScreen('menu')}
+                  onClick={handleLeaveToMenu}
                   className="hover:text-teal-700 dark:hover:text-teal-400 inline-flex items-center gap-1 cursor-pointer whitespace-nowrap shrink-0"
                 >
                   <Home className="w-4 h-4" />
@@ -1562,12 +2510,71 @@ export default function App() {
           {/* Main Game Layout */}
           <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-6 grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
             <div className="lg:col-span-7 xl:col-span-8 space-y-4">
+              {/* Host 30s Offline Turn Banner */}
+              {onlineRole === 'online_host' && offlineCountdown !== null && (
+                <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                    <div className="text-xs sm:text-sm text-amber-950 dark:text-amber-100">
+                      {offlineCountdown > 0 ? (
+                        <span>
+                          <strong>{currentPlayer.name}</strong> офлайн. Қайта қосылуын күтуде:{' '}
+                          <strong className="font-mono-num">{offlineCountdown} с</strong>...
+                        </span>
+                      ) : (
+                        <span>
+                          <strong>{currentPlayer.name}</strong> 30 секунд ішінде оралмады. Әрекет таңдаңыз:
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  {offlineCountdown === 0 && (
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={handleHostSkipOfflineTurn}
+                        className="min-h-[38px] px-3 py-1.5 rounded-lg border border-amber-400 dark:border-amber-600 bg-white dark:bg-slate-900 text-xs font-bold text-slate-900 dark:text-white inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <SkipForward className="w-3.5 h-3.5" />
+                        Өткізіп жіберу
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleHostLetBotPlay}
+                        className="min-h-[38px] px-3 py-1.5 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Bot className="w-3.5 h-3.5" />
+                        Бот ойнасын
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Non-blocking Toast for Spectators when Acting Player Has a Private Modal */}
+              {onlineRole !== 'local' && !isMyOnlineTurn && toastNotice && (
+                <div className="px-4 py-2.5 rounded-xl bg-white dark:bg-[#131C26] border border-teal-200 dark:border-teal-800 shadow-xs flex items-center gap-2.5 text-xs sm:text-sm text-slate-800 dark:text-slate-100">
+                  <span
+                    className="w-2.5 h-2.5 rounded-full shrink-0"
+                    style={{ backgroundColor: toastNotice.playerColor || '#0D7A6F' }}
+                  />
+                  <span>{toastNotice.message}</span>
+                </div>
+              )}
+
               <GameBoard
                 players={players}
                 currentPlayer={currentPlayer}
                 dice={lastDice}
                 rolling={rolling}
-                canRoll={!rolling && !isStepping && !activeModal && !currentPlayer.isBot}
+                canRoll={
+                  !rolling &&
+                  !isStepping &&
+                  !activeModal &&
+                  !currentPlayer.isBot &&
+                  isMyOnlineTurn
+                }
+                waitingOnlineText={waitingOnlineText}
                 onRoll={handleRollDice}
                 lastActionText={logs[0] ? `${logs[0].playerName}: ${logs[0].message}` : ''}
               />
@@ -1575,7 +2582,7 @@ export default function App() {
 
             <div className="lg:col-span-5 xl:col-span-4 space-y-4">
               <MiniStatement
-                player={currentPlayer}
+                player={viewedPlayer}
                 onOpenStatement={() => setShowStatementModal(true)}
                 onOpenLoan={() => setShowLoanModal(true)}
               />
@@ -1591,6 +2598,7 @@ export default function App() {
                   {players.map((p, idx) => {
                     const s = calculatePlayerSummary(p);
                     const isActive = idx === currentPlayerIndex;
+                    const isSelf = onlineRole !== 'local' && p.sessionId === mySessionId;
                     return (
                       <li
                         key={p.id}
@@ -1608,9 +2616,38 @@ export default function App() {
                             {p.tokenSymbol}
                           </span>
                           <div className="min-w-0">
-                            <div className="text-xs font-bold text-slate-900 dark:text-white truncate">
-                              {p.name}
-                              {isActive ? ' · Жүріс' : ''}
+                            <div className="text-xs font-bold text-slate-900 dark:text-white truncate flex items-center gap-1.5">
+                              <span className="truncate">
+                                {p.name}
+                                {isSelf ? ' (Сіз)' : ''}
+                                {isActive ? ' · Жүріс' : ''}
+                              </span>
+                              {onlineRole !== 'local' && (
+                                <span
+                                  title={
+                                    p.botControlled
+                                      ? 'Бот'
+                                      : p.isConnected !== false
+                                      ? 'Онлайн'
+                                      : 'Офлайн'
+                                  }
+                                  className={`inline-flex items-center gap-0.5 text-[10px] font-semibold shrink-0 ${
+                                    p.botControlled
+                                      ? 'text-amber-600 dark:text-amber-400'
+                                      : p.isConnected !== false
+                                      ? 'text-emerald-600 dark:text-emerald-400'
+                                      : 'text-rose-600 dark:text-rose-400'
+                                  }`}
+                                >
+                                  {p.botControlled ? (
+                                    <Bot className="w-3 h-3" />
+                                  ) : p.isConnected !== false ? (
+                                    <Wifi className="w-3 h-3" />
+                                  ) : (
+                                    <WifiOff className="w-3 h-3" />
+                                  )}
+                                </span>
+                              )}
                             </div>
                             <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
                               {p.phase === 'fast_track' ? 'Еркін жол' : p.profession.title}
@@ -1639,8 +2676,8 @@ export default function App() {
                     Соңғы оқиғалар
                   </h2>
                 </div>
-                <ul className="mt-2.5 space-y-2 max-h-52 overflow-y-auto pr-1 text-xs">
-                  {logs.slice(0, 12).map((entry) => (
+                <ul className="mt-2.5 space-y-2 max-h-56 overflow-y-auto pr-1 text-xs">
+                  {logs.slice(0, 20).map((entry) => (
                     <li
                       key={entry.id}
                       className="flex items-start gap-2 text-slate-700 dark:text-slate-300 leading-relaxed"
@@ -1664,7 +2701,7 @@ export default function App() {
         </div>
       )}
 
-      {activeModal && currentPlayer && (
+      {canShowPrivateModal && activeModal && currentPlayer && (
         <EventModal
           modal={activeModal}
           player={currentPlayer}
@@ -1687,18 +2724,20 @@ export default function App() {
         />
       )}
 
-      {showStatementModal && currentPlayer && (
+      {showStatementModal && viewedPlayer && (
         <FinancialStatementModal
-          player={currentPlayer}
+          player={viewedPlayer}
+          readOnlyActions={onlineRole !== 'local' && !isMyOnlineTurn}
           onClose={() => setShowStatementModal(false)}
           onPayLiability={handlePayLiability}
           onRepayBankLoan={handleRepayBankLoan}
         />
       )}
 
-      {showLoanModal && currentPlayer && (
+      {showLoanModal && viewedPlayer && (
         <LoanModal
-          player={currentPlayer}
+          player={viewedPlayer}
+          readOnlyActions={onlineRole !== 'local' && !isMyOnlineTurn}
           onClose={() => setShowLoanModal(false)}
           onTakeLoan={handleTakeManualLoan}
           onRepayBankLoan={handleRepayBankLoan}
@@ -1707,6 +2746,33 @@ export default function App() {
       )}
 
       {showRulesModal && <RulesModal onClose={() => setShowRulesModal(false)} />}
+
+      {hostDisconnected && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="w-full max-w-md bg-white dark:bg-[#131C26] border border-slate-200 dark:border-slate-800 rounded-2xl shadow-xl p-6 text-center space-y-4">
+            <div className="w-12 h-12 mx-auto rounded-full bg-rose-100 dark:bg-rose-950/50 flex items-center justify-center text-rose-600 dark:text-rose-400">
+              <WifiOff className="w-6 h-6" />
+            </div>
+            <h2 className="text-lg font-bold text-slate-900 dark:text-white">
+              Хост ойыннан шықты, ойын аяқталды
+            </h2>
+            <p className="text-sm text-slate-600 dark:text-slate-300">
+              Бөлме иесімен байланыс үзілді. Басты мәзірге оралып, жаңа ойын бастай аласыз.
+            </p>
+            <button
+              type="button"
+              onClick={handleLeaveToMenu}
+              className="w-full min-h-[44px] py-2.5 px-5 rounded-xl bg-teal-700 hover:bg-teal-800 text-white text-sm font-bold cursor-pointer"
+            >
+              Мәзірге қайту
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

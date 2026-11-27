@@ -21,6 +21,7 @@ interface GameBoardProps {
   dice: number[];
   rolling: boolean;
   canRoll: boolean;
+  waitingOnlineText?: string | null;
   onRoll: (useTwoDice?: boolean) => void;
   lastActionText: string;
 }
@@ -107,6 +108,7 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   dice,
   rolling,
   canRoll,
+  waitingOnlineText = null,
   onRoll,
   lastActionText,
 }) => {
@@ -212,6 +214,7 @@ export const GameBoard: React.FC<GameBoardProps> = ({
             isBotTurn={currentPlayer.isBot}
             isFastTrack={isFastTrack}
             charityTurnsLeft={currentPlayer.charityTurnsLeft}
+            waitingOnlineText={waitingOnlineText}
             onRoll={onRoll}
           />
 

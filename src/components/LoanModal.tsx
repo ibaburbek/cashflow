@@ -5,6 +5,7 @@ import { calculatePlayerSummary, formatTenge } from '../utils/format';
 
 interface LoanModalProps {
   player: Player;
+  readOnlyActions?: boolean;
   onClose: () => void;
   onTakeLoan: (amount: number) => void;
   onRepayBankLoan: (amount: number) => void;
@@ -13,6 +14,7 @@ interface LoanModalProps {
 
 export const LoanModal: React.FC<LoanModalProps> = ({
   player,
+  readOnlyActions = false,
   onClose,
   onTakeLoan,
   onRepayBankLoan,
@@ -102,12 +104,19 @@ export const LoanModal: React.FC<LoanModalProps> = ({
               </span>
             </div>
 
+            {readOnlyActions && (
+              <p className="text-xs text-amber-700 dark:text-amber-400">
+                Несие алу немесе қарыз жабу тек өз жүрісіңізде қолжетімді.
+              </p>
+            )}
+
             <button
               type="button"
+              disabled={readOnlyActions}
               onClick={() => {
                 onTakeLoan(loanStep);
               }}
-              className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold transition-colors cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 px-4 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-semibold disabled:opacity-45 transition-colors cursor-pointer"
             >
               {formatTenge(loanStep)} несие алу
             </button>
@@ -137,7 +146,7 @@ export const LoanModal: React.FC<LoanModalProps> = ({
                       return (
                         <button
                           type="button"
-                          disabled={player.cash < stepAmt}
+                          disabled={readOnlyActions || player.cash < stepAmt}
                           onClick={() => onRepayBankLoan(stepAmt)}
                           className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 disabled:opacity-40 cursor-pointer whitespace-nowrap"
                         >
@@ -147,7 +156,7 @@ export const LoanModal: React.FC<LoanModalProps> = ({
                     })()}
                     <button
                       type="button"
-                      disabled={player.cash < player.bankLoan}
+                      disabled={readOnlyActions || player.cash < player.bankLoan}
                       onClick={() => onRepayBankLoan(player.bankLoan)}
                       className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-700 text-white disabled:opacity-40 cursor-pointer whitespace-nowrap"
                     >
@@ -170,7 +179,7 @@ export const LoanModal: React.FC<LoanModalProps> = ({
                   </div>
                   <button
                     type="button"
-                    disabled={player.cash < l.balance}
+                    disabled={readOnlyActions || player.cash < l.balance}
                     onClick={() => onPayLiability(l.id)}
                     className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-700 hover:bg-teal-800 text-white disabled:opacity-40 cursor-pointer whitespace-nowrap shrink-0"
                   >

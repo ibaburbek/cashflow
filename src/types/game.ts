@@ -1,6 +1,7 @@
 export type GamePhase = 'rat_race' | 'fast_track';
-export type ScreenMode = 'menu' | 'playing' | 'victory';
+export type ScreenMode = 'menu' | 'lobby' | 'playing' | 'victory';
 export type ThemeMode = 'light' | 'dark';
+export type OnlineRole = 'local' | 'online_host' | 'online_guest';
 
 export interface TaxBreakdown {
   ipn: number;    // ИПН 10%
@@ -170,6 +171,9 @@ export interface Player {
   fastTrackAddedPassive: number;
   fastTrackTargetPassive: number;
   boughtDream: boolean;
+  sessionId?: string;
+  isConnected?: boolean;
+  botControlled?: boolean;
   stats: {
     turnsPlayed: number;
     dealsBought: number;
@@ -239,3 +243,86 @@ export interface SavedGameState {
   winReason: string | null;
   lastDice: number[];
 }
+
+export interface LobbyPlayer {
+  sessionId: string;
+  name: string;
+  professionId: string;
+  dreamId: string;
+  color: string;
+  tokenSymbol: string;
+  isHost: boolean;
+  isReady: boolean;
+  isConnected: boolean;
+}
+
+export interface ToastNotice {
+  id: string;
+  message: string;
+  playerColor?: string;
+}
+
+export interface OnlineGameSnapshot {
+  screen: 'lobby' | 'playing' | 'victory';
+  roomCode: string;
+  hostSessionId: string;
+  lobbyPlayers: LobbyPlayer[];
+  players: Player[];
+  currentPlayerIndex: number;
+  turnCount: number;
+  logs: TurnLogEntry[];
+  lastDice: number[];
+  rolling: boolean;
+  isStepping: boolean;
+  modalQueue: ActiveModalState[];
+  queueTotalCount: number;
+  winnerId: string | null;
+  winReason: string | null;
+  toast: ToastNotice | null;
+}
+
+export type GuestAction =
+  | {
+      type: 'LOBBY_UPDATE_PROFILE';
+      name: string;
+      professionId: string;
+      dreamId: string;
+      color: string;
+    }
+  | { type: 'LOBBY_TOGGLE_READY'; isReady: boolean }
+  | { type: 'ROLL_DICE'; useTwoDice?: boolean }
+  | { type: 'CHOOSE_DEAL_SIZE'; size: 'small' | 'big' }
+  | { type: 'BUY_DEAL'; quantity: number; useLoanIfNeeded: boolean }
+  | { type: 'SKIP_DEAL' }
+  | { type: 'APPLY_MARKET_EVENT'; sellAssetInstanceIds: string[] }
+  | { type: 'PAY_DOODAD'; useKaspiRed: boolean }
+  | { type: 'CHARITY_DECISION'; accept: boolean }
+  | { type: 'ACK_CHILD' }
+  | { type: 'ACK_DOWNSIZED' }
+  | { type: 'ACK_PAYDAY' }
+  | { type: 'ACK_PHASE_TRANSITION' }
+  | { type: 'BUY_FT_BUSINESS' }
+  | { type: 'BUY_DREAM' }
+  | { type: 'ACK_FT_RISK' }
+  | { type: 'CONFIRM_AUTO_LOAN' }
+  | { type: 'TAKE_MANUAL_LOAN'; amount: number }
+  | { type: 'REPAY_BANK_LOAN'; amount: number }
+  | { type: 'PAY_LIABILITY'; liabilityId: string };
+
+export type PeerMessage =
+  | {
+      type: 'HELLO';
+      sessionId: string;
+      name: string;
+      professionId: string;
+      dreamId: string;
+      preferredColor?: string;
+    }
+  | { type: 'PING'; ts: number }
+  | { type: 'PONG'; ts: number }
+  | { type: 'ACTION'; sessionId: string; action: GuestAction }
+  | { type: 'STATE_SYNC'; snapshot: OnlineGameSnapshot }
+  | { type: 'ROOM_ERROR'; reason: string }
+  | { type: 'KICKED'; reason: string }
+  | { type: 'HOST_CLOSED' };
+

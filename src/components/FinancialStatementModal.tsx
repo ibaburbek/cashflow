@@ -5,6 +5,7 @@ import { calculatePlayerSummary, formatTenge } from '../utils/format';
 
 interface FinancialStatementModalProps {
   player: Player;
+  readOnlyActions?: boolean;
   onClose: () => void;
   onPayLiability: (liabilityId: string) => void;
   onRepayBankLoan: (amount: number) => void;
@@ -12,6 +13,7 @@ interface FinancialStatementModalProps {
 
 export const FinancialStatementModal: React.FC<FinancialStatementModalProps> = ({
   player,
+  readOnlyActions = false,
   onClose,
   onPayLiability,
   onRepayBankLoan,
@@ -273,7 +275,7 @@ export const FinancialStatementModal: React.FC<FinancialStatementModalProps> = (
                         <div className="flex items-center gap-1.5 shrink-0">
                           <button
                             type="button"
-                            disabled={player.cash < stepAmt}
+                            disabled={readOnlyActions || player.cash < stepAmt}
                             onClick={() => onRepayBankLoan(stepAmt)}
                             className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-100 dark:bg-amber-900/50 text-amber-900 dark:text-amber-200 hover:bg-amber-200 disabled:opacity-40 cursor-pointer whitespace-nowrap"
                           >
@@ -281,7 +283,7 @@ export const FinancialStatementModal: React.FC<FinancialStatementModalProps> = (
                           </button>
                           <button
                             type="button"
-                            disabled={player.cash < player.bankLoan}
+                            disabled={readOnlyActions || player.cash < player.bankLoan}
                             onClick={() => onRepayBankLoan(player.bankLoan)}
                             className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-700 text-white hover:bg-teal-800 disabled:opacity-40 cursor-pointer whitespace-nowrap"
                           >
@@ -304,7 +306,7 @@ export const FinancialStatementModal: React.FC<FinancialStatementModalProps> = (
                       </div>
                       <button
                         type="button"
-                        disabled={player.cash < l.balance}
+                        disabled={readOnlyActions || player.cash < l.balance}
                         onClick={() => onPayLiability(l.id)}
                         className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-800 dark:text-slate-100 disabled:opacity-40 cursor-pointer whitespace-nowrap shrink-0"
                       >

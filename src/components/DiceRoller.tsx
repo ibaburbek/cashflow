@@ -49,6 +49,7 @@ interface DiceRollerProps {
   isBotTurn: boolean;
   isFastTrack: boolean;
   charityTurnsLeft: number;
+  waitingOnlineText?: string | null;
   onRoll: (useTwoDice?: boolean) => void;
 }
 
@@ -60,6 +61,7 @@ export const DiceRoller: React.FC<DiceRollerProps> = ({
   isBotTurn,
   isFastTrack,
   charityTurnsLeft,
+  waitingOnlineText = null,
   onRoll,
 }) => {
   const total = dice.reduce((a, b) => a + b, 0);
@@ -81,6 +83,10 @@ export const DiceRoller: React.FC<DiceRollerProps> = ({
       {isBotTurn ? (
         <div className="px-4 py-2 text-xs font-semibold text-teal-800 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800 rounded-lg whitespace-nowrap">
           Бот жүріс жасауда...
+        </div>
+      ) : waitingOnlineText ? (
+        <div className="px-4 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg text-center">
+          {waitingOnlineText}
         </div>
       ) : (
         <div className="flex flex-wrap items-center justify-center gap-2">

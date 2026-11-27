@@ -1,9 +1,14 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
+  AlertCircle,
   BookOpen,
   Bot,
+  Globe,
+  Loader2,
+  LogIn,
   Moon,
   Play,
+  PlusCircle,
   RotateCcw,
   Sun,
   User,
@@ -15,6 +20,8 @@ import { DREAMS } from '../data/assets';
 import { PROFESSIONS } from '../data/professions';
 import { ThemeMode } from '../types/game';
 import { formatTenge } from '../utils/format';
+import { loadOnlineProfile } from '../utils/storage';
+import { normalizeRoomCode } from '../utils/peerManager';
 import { QoshqarMuiizDivider, QoshqarMuiizEmblem } from './KazakhOrnament';
 
 export interface PlayerDraft {
@@ -24,15 +31,22 @@ export interface PlayerDraft {
   dreamId: string;
 }
 
+type SetupMode = 'bots' | 'hotseat' | 'online';
+
 interface SetupScreenProps {
   hasSavedGame: boolean;
   theme: ThemeMode;
   soundEnabled: boolean;
+  initialRoomCode?: string;
+  onlineBusy?: boolean;
+  onlineError?: string | null;
   onToggleTheme: () => void;
   onToggleSound: () => void;
   onResumeSavedGame: () => void;
   onOpenRules: () => void;
   onStartNewGame: (drafts: PlayerDraft[]) => void;
+  onCreateOnlineRoom: (playerName: string) => void;
+  onJoinOnlineRoom: (roomCode: string, playerName: string) => void;
 }
 
 const DEFAULT_NAMES = [
@@ -48,14 +62,28 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
   hasSavedGame,
   theme,
   soundEnabled,
+  initialRoomCode = '',
+  onlineBusy = false,
+  onlineError = null,
   onToggleTheme,
   onToggleSound,
   onResumeSavedGame,
   onOpenRules,
   onStartNewGame,
+  onCreateOnlineRoom,
+  onJoinOnlineRoom,
 }) => {
+  const savedProfile = loadOnlineProfile();
+  const [setupMode, setSetupMode] = useState<SetupMode>(() =>
+    initialRoomCode ? 'online' : 'bots'
+  );
   const [playerCount, setPlayerCount] = useState<number>(2);
-  const [botQuickMode, setBotQuickMode] = useState<boolean>(true);
+  const [onlineName, setOnlineName] = useState<string>(
+    () => savedProfile?.name || 'Ойыншы'
+  );
+  const [joinCode, setJoinCode] = useState<string>(() =>
+    normalizeRoomCode(initialRoomCode)
+  );
   const [drafts, setDrafts] = useState<PlayerDraft[]>(() =>
     Array.from({ length: 6 }).map((_, idx) => ({
       name: idx === 0 ? 'Ойыншы 1' : idx === 1 ? 'Бот Арман' : DEFAULT_NAMES[idx],
@@ -65,12 +93,21 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
     }))
   );
 
+  useEffect(() => {
+    if (initialRoomCode) {
+      setSetupMode('online');
+      setJoinCode(normalizeRoomCode(initialRoomCode));
+    }
+  }, [initialRoomCode]);
+
   const handleCountChange = (count: number) => {
     setPlayerCount(count);
   };
 
-  const handleBotModeToggle = (vsBot: boolean) => {
-    setBotQuickMode(vsBot);
+  const handleModeChange = (mode: SetupMode) => {
+    setSetupMode(mode);
+    if (mode === 'online') return;
+    const vsBot = mode === 'bots';
     setDrafts((prev) =>
       prev.map((d, idx) => {
         if (idx === 0) return { ...d, isBot: false };
@@ -174,41 +211,17 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
         {/* Setup Panel */}
         <section className="bg-white dark:bg-[#131C26] border border-slate-200 dark:border-slate-800 rounded-2xl p-5 sm:p-7 shadow-sm space-y-6">
           <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-5 border-b border-slate-200 dark:border-slate-800">
-            {/* Player Count */}
-            <div className="space-y-2">
-              <label className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-                <Users className="w-4 h-4 text-teal-700 dark:text-teal-400" />
-                Ойыншылар саны (1–6)
-              </label>
-              <div className="flex items-center gap-1.5">
-                {[1, 2, 3, 4, 5, 6].map((num) => (
-                  <button
-                    key={num}
-                    type="button"
-                    onClick={() => handleCountChange(num)}
-                    className={`w-11 h-11 rounded-xl text-sm font-bold transition-colors cursor-pointer ${
-                      playerCount === num
-                        ? 'bg-teal-700 text-white shadow-sm'
-                        : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
-                    }`}
-                  >
-                    {num}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Play vs Bots / Hot-seat Toggle */}
+            {/* Mode Toggle */}
             <div className="space-y-2">
               <span className="text-sm font-bold text-slate-900 dark:text-white block">
                 Ойын режимі
               </span>
-              <div className="inline-flex p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
+              <div className="flex flex-wrap p-1 rounded-xl bg-slate-100 dark:bg-slate-800 gap-1">
                 <button
                   type="button"
-                  onClick={() => handleBotModeToggle(true)}
+                  onClick={() => handleModeChange('bots')}
                   className={`px-3.5 py-2 text-xs sm:text-sm font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
-                    botQuickMode
+                    setupMode === 'bots'
                       ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
                       : 'text-slate-600 dark:text-slate-400'
                   }`}
@@ -218,9 +231,9 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleBotModeToggle(false)}
+                  onClick={() => handleModeChange('hotseat')}
                   className={`px-3.5 py-2 text-xs sm:text-sm font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
-                    !botQuickMode
+                    setupMode === 'hotseat'
                       ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
                       : 'text-slate-600 dark:text-slate-400'
                   }`}
@@ -228,9 +241,137 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
                   <User className="w-4 h-4" />
                   Бір құрылғыда (Достармен)
                 </button>
+                <button
+                  type="button"
+                  onClick={() => handleModeChange('online')}
+                  className={`px-3.5 py-2 text-xs sm:text-sm font-semibold rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap ${
+                    setupMode === 'online'
+                      ? 'bg-white dark:bg-slate-900 text-teal-700 dark:text-teal-400 shadow-xs'
+                      : 'text-slate-600 dark:text-slate-400'
+                  }`}
+                >
+                  <Globe className="w-4 h-4" />
+                  Онлайн ойын
+                </button>
               </div>
             </div>
+
+            {/* Player Count (local modes only) */}
+            {setupMode !== 'online' && (
+              <div className="space-y-2">
+                <label className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <Users className="w-4 h-4 text-teal-700 dark:text-teal-400" />
+                  Ойыншылар саны (1–6)
+                </label>
+                <div className="flex items-center gap-1.5">
+                  {[1, 2, 3, 4, 5, 6].map((num) => (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => handleCountChange(num)}
+                      className={`w-11 h-11 rounded-xl text-sm font-bold transition-colors cursor-pointer ${
+                        playerCount === num
+                          ? 'bg-teal-700 text-white shadow-sm'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      {num}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
+
+          {setupMode === 'online' ? (
+            <div className="space-y-5">
+              {onlineError && (
+                <div className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 text-sm text-rose-800 dark:text-rose-200 flex items-start gap-2.5">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 text-rose-600 dark:text-rose-400" />
+                  <span>{onlineError}</span>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5">
+                  Ойындағы есіміңіз
+                </label>
+                <input
+                  type="text"
+                  value={onlineName}
+                  maxLength={24}
+                  onChange={(e) => setOnlineName(e.target.value)}
+                  placeholder="Атыңызды жазыңыз"
+                  className="w-full sm:max-w-sm min-h-[44px] px-3.5 py-2 text-sm rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-teal-600"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Create Room */}
+                <div className="p-5 rounded-2xl border border-teal-200 dark:border-teal-800/70 bg-teal-50/50 dark:bg-teal-950/20 flex flex-col justify-between gap-4">
+                  <div className="space-y-1.5">
+                    <div className="flex items-center gap-2 text-teal-800 dark:text-teal-300 font-bold text-base">
+                      <PlusCircle className="w-5 h-5" />
+                      Бөлме құру
+                    </div>
+                    <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                      Жаңа ойын бөлмесін ашып, достарыңызға 5 таңбалы кодты немесе сілтемені жіберіңіз (2–6 ойыншы).
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={onlineBusy}
+                    onClick={() => onCreateOnlineRoom(onlineName)}
+                    className="w-full min-h-[46px] px-5 py-2.5 rounded-xl bg-teal-700 hover:bg-teal-800 dark:bg-teal-600 dark:hover:bg-teal-500 text-white text-sm font-bold shadow-sm disabled:opacity-50 inline-flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {onlineBusy ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <PlusCircle className="w-4 h-4" />
+                    )}
+                    Бөлме құру
+                  </button>
+                </div>
+
+                {/* Join Room */}
+                <div className="p-5 rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 flex flex-col justify-between gap-4">
+                  <div className="space-y-3">
+                    <div className="flex items-center gap-2 text-slate-900 dark:text-white font-bold text-base">
+                      <LogIn className="w-5 h-5 text-amber-600 dark:text-amber-400" />
+                      Бөлмеге қосылу
+                    </div>
+                    <div>
+                      <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1">
+                        5 таңбалы бөлме коды
+                      </label>
+                      <input
+                        type="text"
+                        value={joinCode}
+                        maxLength={5}
+                        onChange={(e) => setJoinCode(normalizeRoomCode(e.target.value))}
+                        placeholder="Мысалы: A7K9P"
+                        className="w-full min-h-[44px] px-3.5 py-2 text-base font-bold tracking-[0.2em] uppercase font-mono-num rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-amber-500"
+                      />
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={onlineBusy || joinCode.length !== 5}
+                    onClick={() => onJoinOnlineRoom(joinCode, onlineName)}
+                    className="w-full min-h-[46px] px-5 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-sm font-bold shadow-sm disabled:opacity-45 inline-flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {onlineBusy ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <LogIn className="w-4 h-4" />
+                    )}
+                    Бөлмеге қосылу
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <>
 
           {/* Players Config Grid */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -368,6 +509,8 @@ export const SetupScreen: React.FC<SetupScreenProps> = ({
               Жаңа ойын бастау
             </button>
           </div>
+            </>
+          )}
         </section>
       </main>
     </div>
